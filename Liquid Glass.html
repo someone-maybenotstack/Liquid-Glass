@@ -1,0 +1,1290 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Liquid Glass · 液态玻璃</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    overflow: hidden;
+    background: #0a0a0a;
+  }
+  canvas {
+    display: block;
+    width: 100vw;
+    height: 100vh;
+  }
+</style>
+</head>
+<body>
+<canvas id="gl"></canvas>
+<script>
+'use strict';
+
+/* ==================================================================
+   着色器源码 —— 原样取自 liquid-glass-studio-main/src/shaders
+   ================================================================== */
+
+const VERTEX_GLSL = `#version 300 es
+
+in vec4 a_position;
+out vec2 v_uv;
+
+void main() {
+  v_uv = (a_position.xy + 1.0) * 0.5;
+  gl_Position = a_position;
+}
+`;
+
+const LIB_SDF_GLSL = `// Signed distance functions shared by the background and main passes.
+// Requires these uniforms to be declared by the includer:
+//   float u_dpr; vec2 u_resolution; int u_showShape1;
+//   float u_shapeWidth, u_shapeHeight, u_shapeRadius, u_shapeRoundness, u_mergeRate;
+
+float sdCircle(vec2 p, float r) {
+  return length(p) - r;
+}
+
+float superellipseCornerSDF(vec2 p, float r, float n) {
+  p = abs(p);
+  float v = pow(pow(p.x, n) + pow(p.y, n), 1.0 / n);
+  return v - r;
+}
+
+float roundedRectSDF(vec2 p, vec2 center, float width, float height, float cornerRadius, float n) {
+  p -= center;
+
+  float cr = cornerRadius * u_dpr;
+
+  vec2 d = abs(p) - vec2(width * u_dpr, height * u_dpr) * 0.5;
+
+  float dist;
+
+  if (d.x > -cr && d.y > -cr) {
+    vec2 cornerCenter = sign(p) * (vec2(width * u_dpr, height * u_dpr) * 0.5 - vec2(cr));
+    vec2 cornerP = p - cornerCenter;
+    dist = superellipseCornerSDF(cornerP, cr, n);
+  } else {
+    dist = min(max(d.x, d.y), 0.0) + length(max(d, 0.0));
+  }
+
+  return dist;
+}
+
+float smin(float a, float b, float k) {
+  float h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0);
+  return mix(b, a, h) - k * h * (1.0 - h);
+}
+
+float mainSDF(vec2 p1, vec2 p2, vec2 p) {
+  vec2 p1n = p1 + p / u_resolution.y;
+  vec2 p2n = p2 + p / u_resolution.y;
+
+  float d1 = u_showShape1 == 1 ? sdCircle(p1n, 100.0 * u_dpr / u_resolution.y) : 1.0;
+  float d2 = roundedRectSDF(
+    p2n,
+    vec2(0.0),
+    u_shapeWidth / u_resolution.y,
+    u_shapeHeight / u_resolution.y,
+    u_shapeRadius / u_resolution.y,
+    u_shapeRoundness
+  );
+
+  return smin(d1, d2, u_mergeRate);
+}
+`;
+
+const LIB_MATH_GLSL = `float safeAsin(float x) {
+  return asin(clamp(x, -1.0, 1.0));
+}
+`;
+
+const LIB_COLOR_GLSL = `vec3 hsv2rgb(vec3 c) {
+  vec4 K = vec4(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);
+  vec3 p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);
+  return c.z * mix(K.xxx, clamp(p - K.xxx, 0.0, 1.0), c.y);
+}
+
+const vec3 D65_WHITE = vec3(0.95045592705, 1.0, 1.08905775076);
+const vec3 D50_WHITE = vec3(0.96429567643, 1.0, 0.82510460251);
+vec3 WHITE = D65_WHITE;
+const mat3 RGB_TO_XYZ_M = mat3(
+  0.4124, 0.3576, 0.1805,
+  0.2126, 0.7152, 0.0722,
+  0.0193, 0.1192, 0.9505
+);
+const mat3 XYZ_TO_XYZ50_M = mat3(
+   1.0479298208405488  ,  0.022946793341019088, -0.05019222954313557 ,
+   0.029627815688159344,  0.990434484573249   , -0.01707382502938514 ,
+  -0.009243058152591178,  0.015055144896577895,  0.7518742899580008
+);
+const mat3 XYZ_TO_RGB_M = mat3(
+   3.2406255, -1.537208 , -0.4986286,
+  -0.9689307,  1.8757561,  0.0415175,
+   0.0557101, -0.2040211,  1.0569959
+);
+const mat3 XYZ50_TO_XYZ_M = mat3(
+   0.9554734527042182  , -0.023098536874261423,  0.0632593086610217  ,
+  -0.028369706963208136,  1.0099954580058226  ,  0.021041398966943008,
+   0.012314001688319899, -0.020507696433477912,  1.3303659366080753
+);
+float UNCOMPAND_SRGB(float a) {
+  return a > 0.04045
+    ? pow((a + 0.055) / 1.055, 2.4)
+    : a / 12.92;
+}
+float COMPAND_RGB(float a) {
+  return a <= 0.0031308
+    ? 12.92 * a
+    : 1.055 * pow(a, 0.41666666666) - 0.055;
+}
+vec3 RGB_TO_XYZ(vec3 rgb) {
+  return WHITE == D65_WHITE
+    ? rgb * RGB_TO_XYZ_M
+    : rgb * RGB_TO_XYZ_M * XYZ_TO_XYZ50_M;
+}
+vec3 SRGB_TO_RGB(vec3 srgb) {
+  return vec3(UNCOMPAND_SRGB(srgb.x), UNCOMPAND_SRGB(srgb.y), UNCOMPAND_SRGB(srgb.z));
+}
+vec3 RGB_TO_SRGB(vec3 rgb) {
+  return vec3(COMPAND_RGB(rgb.x), COMPAND_RGB(rgb.y), COMPAND_RGB(rgb.z));
+}
+vec3 SRGB_TO_XYZ(vec3 srgb) {
+  return RGB_TO_XYZ(SRGB_TO_RGB(srgb));
+}
+float XYZ_TO_LAB_F(float x) {
+  return x > 0.00885645167
+    ? pow(x, 0.333333333)
+    : 7.78703703704 * x + 0.13793103448;
+}
+vec3 XYZ_TO_LAB(vec3 xyz) {
+  vec3 xyz_scaled = xyz / WHITE;
+  xyz_scaled = vec3(
+    XYZ_TO_LAB_F(xyz_scaled.x),
+    XYZ_TO_LAB_F(xyz_scaled.y),
+    XYZ_TO_LAB_F(xyz_scaled.z)
+  );
+  return vec3(
+    116.0 * xyz_scaled.y - 16.0,
+    500.0 * (xyz_scaled.x - xyz_scaled.y),
+    200.0 * (xyz_scaled.y - xyz_scaled.z)
+  );
+}
+vec3 SRGB_TO_LAB(vec3 srgb) {
+  return XYZ_TO_LAB(SRGB_TO_XYZ(srgb));
+}
+vec3 LAB_TO_LCH(vec3 Lab) {
+  return vec3(Lab.x, sqrt(dot(Lab.yz, Lab.yz)), atan(Lab.z, Lab.y) * 57.2957795131);
+}
+vec3 SRGB_TO_LCH(vec3 srgb) {
+  return LAB_TO_LCH(SRGB_TO_LAB(srgb));
+}
+vec3 XYZ_TO_RGB(vec3 xyz) {
+  return WHITE == D65_WHITE
+    ? xyz * XYZ_TO_RGB_M
+    : xyz * XYZ50_TO_XYZ_M * XYZ_TO_RGB_M;
+}
+vec3 XYZ_TO_SRGB(vec3 xyz) {
+  return RGB_TO_SRGB(XYZ_TO_RGB(xyz));
+}
+float LAB_TO_XYZ_F(float x) {
+  return x > 0.206897
+    ? x * x * x
+    : 0.12841854934 * (x - 0.137931034);
+}
+vec3 LAB_TO_XYZ(vec3 Lab) {
+  float w = (Lab.x + 16.0) / 116.0;
+  return WHITE *
+  vec3(LAB_TO_XYZ_F(w + Lab.y / 500.0), LAB_TO_XYZ_F(w), LAB_TO_XYZ_F(w - Lab.z / 200.0));
+}
+vec3 LAB_TO_SRGB(vec3 lab) {
+  return XYZ_TO_SRGB(LAB_TO_XYZ(lab));
+}
+vec3 LCH_TO_LAB(vec3 LCh) {
+  return vec3(LCh.x, LCh.y * cos(LCh.z * 0.01745329251), LCh.y * sin(LCh.z * 0.01745329251));
+}
+vec3 LCH_TO_SRGB(vec3 lch) {
+  return LAB_TO_SRGB(LCH_TO_LAB(lch));
+}
+`;
+
+const FRAGMENT_BG_GLSL = `#version 300 es
+
+precision highp float;
+
+in vec2 v_uv;
+out vec4 fragColor;
+
+uniform vec2 u_resolution;
+uniform float u_dpr;
+uniform vec2 u_mouse;
+uniform vec2 u_mouseSpring;
+uniform float u_time;
+uniform float u_mergeRate;
+uniform float u_shapeWidth;
+uniform float u_shapeHeight;
+uniform float u_shapeRadius;
+uniform float u_shapeRoundness;
+uniform float u_shadowExpand;
+uniform float u_shadowFactor;
+uniform vec2 u_shadowPosition;
+uniform int u_bgType;
+uniform sampler2D u_bgTexture;
+uniform float u_bgTextureRatio;
+uniform int u_bgTextureReady;
+uniform int u_showShape1;
+
+float chessboard(vec2 uv, float size, int mode) {
+  float yBars = step(size * 2.0, mod(uv.y * 2.0, size * 4.0));
+  float xBars = step(size * 2.0, mod(uv.x * 2.0, size * 4.0));
+
+  if (mode == 0) {
+    return yBars;
+  } else if (mode == 1) {
+    return xBars;
+  } else {
+    return abs(yBars - xBars);
+  }
+}
+
+float halfColor(vec2 uv) {
+  if (uv.y > 0.5) {
+    return 1.0;
+  } else {
+    return 0.0;
+  }
+}
+
+#include './lib/sdf.glsl'
+
+float sdgMin(float a, float b) {
+  return a < b
+    ? a
+    : b;
+}
+
+vec2 getCoverUV(vec2 uv, float canvasAspect, float textureAspect) {
+  if (canvasAspect > textureAspect) {
+    float scale = textureAspect / canvasAspect;
+    uv.y = uv.y * scale + 0.5 - 0.5 * scale;
+  } else {
+    float scale = canvasAspect / textureAspect;
+    uv.x = uv.x * scale + 0.5 - 0.5 * scale;
+  }
+  return uv;
+}
+
+void main() {
+  vec2 u_resolution1x = u_resolution.xy / u_dpr;
+  vec3 bgColor = vec3(1.0);
+
+  if (u_bgType <= 0) {
+    bgColor = vec3(1.0 - chessboard(gl_FragCoord.xy / u_dpr, 20.0, 2) / 4.0);
+  } else if (u_bgType <= 1) {
+    if (v_uv.x < 0.5 && v_uv.y > 0.5) {
+      bgColor = vec3(chessboard(gl_FragCoord.xy / u_dpr, 10.0, 0));
+    } else if (v_uv.x > 0.5 && v_uv.y < 0.5) {
+      bgColor = vec3(chessboard(gl_FragCoord.xy / u_dpr, 10.0, 1));
+    } else if (v_uv.x < 0.5 && v_uv.y < 0.5) {
+      bgColor = vec3(0.0);
+    }
+  } else if (u_bgType <= 2) {
+    bgColor = vec3(halfColor(gl_FragCoord.xy / u_resolution) * 0.6 + 0.3);
+  } else if (u_bgType <= 11) {
+    if (u_bgTextureReady != 1) {
+      bgColor = vec3(1.0 - chessboard(gl_FragCoord.xy / u_dpr, 20.0, 2) / 4.0);
+    } else {
+      vec2 uv = getCoverUV(v_uv, u_resolution.x / u_resolution.y, u_bgTextureRatio);
+      bgColor = texture(u_bgTexture, uv).rgb;
+    }
+  }
+
+  vec2 p1 =
+    (vec2(0, 0) -
+      u_resolution.xy * 0.5 +
+      vec2(u_shadowPosition.x * u_dpr, u_shadowPosition.y * u_dpr)) /
+    u_resolution.y;
+  vec2 p2 =
+    (vec2(0, 0) - u_mouseSpring + vec2(u_shadowPosition.x * u_dpr, u_shadowPosition.y * u_dpr)) /
+    u_resolution.y;
+  float merged = mainSDF(p1, p2, gl_FragCoord.xy);
+
+  float shadow = exp(-1.0 / u_shadowExpand * abs(merged) * u_resolution1x.y) * 0.6 * u_shadowFactor;
+
+  fragColor = vec4(bgColor - vec3(shadow), 1.0);
+}
+`;
+
+const FRAGMENT_BG_VBLUR_GLSL = `#version 300 es
+
+precision highp float;
+
+#define MAX_BLUR_RADIUS (200)
+
+in vec2 v_uv;
+
+uniform sampler2D u_prevPassTexture;
+uniform vec2 u_resolution;
+uniform int u_blurRadius;
+uniform float u_blurWeights[MAX_BLUR_RADIUS + 1];
+
+out vec4 fragColor;
+
+void main() {
+  vec2 texelSize = 1.0 / u_resolution;
+  vec4 color = texture(u_prevPassTexture, v_uv) * u_blurWeights[0];
+  for (int i = 1; i <= u_blurRadius; ++i) {
+    float w = u_blurWeights[i];
+    vec2 offset = vec2(float(i)) * texelSize;
+    color += texture(u_prevPassTexture, v_uv + vec2(offset.x, 0.0)) * w;
+    color += texture(u_prevPassTexture, v_uv - vec2(offset.x, 0.0)) * w;
+  }
+  fragColor = color;
+}
+`;
+
+const FRAGMENT_BG_HBLUR_GLSL = `#version 300 es
+
+precision highp float;
+
+#define MAX_BLUR_RADIUS (200)
+
+in vec2 v_uv;
+
+uniform sampler2D u_prevPassTexture;
+uniform vec2 u_resolution;
+uniform int u_blurRadius;
+uniform float u_blurWeights[MAX_BLUR_RADIUS + 1];
+
+out vec4 fragColor;
+
+void main() {
+  vec2 texelSize = 1.0 / u_resolution;
+  vec4 color = texture(u_prevPassTexture, v_uv) * u_blurWeights[0];
+  for (int i = 1; i <= u_blurRadius; ++i) {
+    float w = u_blurWeights[i];
+    vec2 offset = vec2(float(i)) * texelSize;
+    color += texture(u_prevPassTexture, v_uv + vec2(0.0, offset.y)) * w;
+    color += texture(u_prevPassTexture, v_uv - vec2(0.0, offset.y)) * w;
+  }
+  fragColor = color;
+}
+`;
+
+const FRAGMENT_MAIN_GLSL = `#version 300 es
+
+precision highp float;
+
+#define PI (3.14159265359)
+
+const float N_R = 1.0 - 0.02;
+const float N_G = 1.0;
+const float N_B = 1.0 + 0.02;
+
+in vec2 v_uv;
+uniform sampler2D u_blurredBg;
+uniform sampler2D u_bg;
+uniform vec2 u_resolution;
+uniform float u_dpr;
+uniform vec2 u_mouse;
+uniform vec2 u_mouseSpring;
+uniform float u_mergeRate;
+uniform float u_shapeWidth;
+uniform float u_shapeHeight;
+uniform float u_shapeRadius;
+uniform float u_shapeRoundness;
+uniform vec4 u_tint;
+uniform float u_refThickness;
+uniform float u_refDistance;
+uniform float u_refFactor;
+uniform float u_refDispersion;
+uniform float u_refFresnelRange;
+uniform float u_refFresnelFactor;
+uniform float u_refFresnelHardness;
+uniform float u_glareRange;
+uniform float u_glareConvergence;
+uniform float u_glareOppositeFactor;
+uniform float u_glareFactor;
+uniform float u_glareHardness;
+uniform float u_glareAngle;
+uniform int u_blurEdge;
+uniform int u_showShape1;
+
+uniform int STEP;
+
+out vec4 fragColor;
+
+#include './lib/sdf.glsl'
+#include './lib/math.glsl'
+
+vec2 getNormal(vec2 p1, vec2 p2, vec2 p) {
+  vec2 h = vec2(max(abs(dFdx(p.x)), 0.0001), max(abs(dFdy(p.y)), 0.0001));
+
+  vec2 grad =
+    vec2(
+      mainSDF(p1, p2, p + vec2(h.x, 0.0)) - mainSDF(p1, p2, p - vec2(h.x, 0.0)),
+      mainSDF(p1, p2, p + vec2(0.0, h.y)) - mainSDF(p1, p2, p - vec2(0.0, h.y))
+    ) /
+    (2.0 * h);
+
+  return grad * 1.414213562 * 1000.0;
+}
+
+#include './lib/color.glsl'
+
+float vec2ToAngle(vec2 v) {
+  float angle = atan(v.y, v.x);
+  if (angle < 0.0) angle += 2.0 * PI;
+  return angle;
+}
+
+vec3 vec2ToRgb(vec2 v) {
+  float angle = atan(v.y, v.x);
+  if (angle < 0.0) angle += 2.0 * PI;
+  float hue = angle / (2.0 * PI);
+  vec3 hsv = vec3(hue, 1.0, 1.0);
+  return hsv2rgb(hsv);
+}
+
+vec4 getTextureDispersion(
+  sampler2D tex1,
+  sampler2D tex2,
+  float mixRate,
+  vec2 offset,
+  float factor
+) {
+  vec4 pixel = vec4(1.0);
+
+  float bgR = texture(tex1, v_uv + offset * (1.0 - (N_R - 1.0) * factor)).r;
+  float bgG = texture(tex1, v_uv + offset * (1.0 - (N_G - 1.0) * factor)).g;
+  float bgB = texture(tex1, v_uv + offset * (1.0 - (N_B - 1.0) * factor)).b;
+
+  float blurR = texture(tex2, v_uv + offset * (1.0 - (N_R - 1.0) * factor)).r;
+  float blurG = texture(tex2, v_uv + offset * (1.0 - (N_G - 1.0) * factor)).g;
+  float blurB = texture(tex2, v_uv + offset * (1.0 - (N_B - 1.0) * factor)).b;
+
+  pixel.r = mix(bgR, blurR, mixRate);
+  pixel.g = mix(bgG, blurG, mixRate);
+  pixel.b = mix(bgB, blurB, mixRate);
+
+  return pixel;
+}
+
+void main() {
+  vec2 u_resolution1x = u_resolution.xy / u_dpr;
+  vec2 p1 = (vec2(0, 0) - u_resolution.xy * 0.5) / u_resolution.y;
+  vec2 p2 = (vec2(0, 0) - u_mouseSpring) / u_resolution.y;
+  float merged = mainSDF(p1, p2, gl_FragCoord.xy);
+
+  vec4 outColor = vec4(0.0);
+
+  if (STEP <= 0) {
+    float px = 2.0 / u_resolution.y;
+    vec3 col = merged > 0.0 ? vec3(1.0, 1.0, 1.0) * merged : vec3(1.0, 1.0, 1.0) * -merged * 2.0;
+    col *= 3.0;
+    col = mix(
+      col,
+      vec3(1.0),
+      1.0 - smoothstep(0.5 / u_resolution1x.y - px, 0.5 / u_resolution1x.y + px, abs(merged))
+    );
+    outColor = vec4(col, 1.0);
+  } else if (STEP <= 1) {
+    float px = 2.0 / u_resolution.y;
+    vec3 col = merged > 0.0 ? vec3(0.9, 0.6, 0.3) : vec3(0.65, 0.85, 1.0);
+    col *= 1.0 - exp(-0.03 * abs(merged) * u_resolution1x.y);
+    col *= 0.6 + 0.4 * smoothstep(-0.5, 0.5, cos(0.25 * abs(merged) * u_resolution1x.y * 2.0));
+    col = mix(
+      col,
+      vec3(1.0),
+      1.0 - smoothstep(1.5 / u_resolution1x.y - px, 1.5 / u_resolution1x.y + px, abs(merged))
+    );
+    outColor = vec4(col, 1.0);
+  } else if (STEP <= 2) {
+    if (merged < 0.0) {
+      vec2 normal = getNormal(p1, p2, gl_FragCoord.xy);
+      vec3 normalColor = vec2ToRgb(normal);
+      float l = length(normal);
+      outColor = vec4(normalColor, l);
+    } else {
+      outColor = vec4(vec3(0.8), 0.0);
+    }
+  } else if (STEP <= 3) {
+    if (merged < 0.0) {
+      float nmerged = -1.0 * (merged * u_resolution1x.y);
+      float x_R_ratio = 1.0 - nmerged / u_refThickness;
+      float thetaI = safeAsin(pow(x_R_ratio, 2.0));
+      float thetaT = safeAsin(1.0 / u_refFactor * sin(thetaI));
+      float edgeFactor = -1.0 * tan(thetaT - thetaI);
+      if (nmerged >= u_refThickness) edgeFactor = 0.0;
+      if (nmerged < u_refThickness) {
+        outColor = vec4(vec3(edgeFactor), 1.0);
+      } else {
+        outColor = vec4(vec3(0.0), 1.0);
+      }
+    } else {
+      outColor = vec4(0.0);
+    }
+  } else if (STEP <= 4) {
+    if (merged < 0.0) {
+      vec2 normal = getNormal(p1, p2, gl_FragCoord.xy);
+      vec3 normalColor = vec2ToRgb(normal);
+      float nmerged = -1.0 * (merged * u_resolution1x.y);
+      float x_R_ratio = 1.0 - nmerged / u_refThickness;
+      float thetaI = safeAsin(pow(x_R_ratio, 2.0));
+      float thetaT = safeAsin(1.0 / u_refFactor * sin(thetaI));
+      float edgeFactor = -1.0 * tan(thetaT - thetaI);
+      if (nmerged >= u_refThickness) edgeFactor = 0.0;
+      outColor = vec4(normalColor * edgeFactor * u_dpr * length(normal), 1.0);
+    } else {
+      outColor = vec4(0.0);
+    }
+  } else if (STEP <= 5) {
+    if (merged < 0.0) {
+      outColor = texture(u_blurredBg, v_uv);
+    } else {
+      outColor = texture(u_bg, v_uv);
+    }
+  } else if (STEP <= 6) {
+    if (merged < 0.0) {
+      vec2 normal = getNormal(p1, p2, gl_FragCoord.xy);
+      float nmerged = -1.0 * (merged * u_resolution1x.y);
+      float x_R_ratio = 1.0 - nmerged / u_refThickness;
+      float thetaI = safeAsin(pow(x_R_ratio, 2.0));
+      float thetaT = safeAsin(1.0 / u_refFactor * sin(thetaI));
+      float edgeFactor = -1.0 * tan(thetaT - thetaI);
+      if (nmerged >= u_refThickness) edgeFactor = 0.0;
+      if (edgeFactor <= 0.0) {
+        outColor = texture(u_blurredBg, v_uv);
+      } else {
+        outColor = texture(
+          u_blurredBg,
+          v_uv - normal * edgeFactor * u_refDistance * u_dpr *
+            vec2(u_resolution.y / u_resolution1x.x, 1.0)
+        );
+      }
+    } else {
+      outColor = texture(u_bg, v_uv);
+    }
+  } else if (STEP <= 7) {
+    if (merged < 0.0) {
+      vec2 normal = getNormal(p1, p2, gl_FragCoord.xy);
+      float nmerged = -1.0 * (merged * u_resolution1x.y);
+      float x_R_ratio = 1.0 - nmerged / u_refThickness;
+      float thetaI = safeAsin(pow(x_R_ratio, 2.0));
+      float thetaT = safeAsin(1.0 / u_refFactor * sin(thetaI));
+      float edgeFactor = -1.0 * tan(thetaT - thetaI);
+      if (nmerged >= u_refThickness) edgeFactor = 0.0;
+
+      float fresnelFactor = clamp(
+        pow(
+          1.0 + merged * u_resolution1x.y / 1500.0 * pow(500.0 / u_refFresnelRange, 2.0) +
+            u_refFresnelHardness,
+          5.0
+        ),
+        0.0,
+        1.0
+      );
+
+      if (edgeFactor <= 0.0) {
+        outColor = texture(u_blurredBg, v_uv);
+      } else {
+        vec4 blurredPixel = texture(
+          u_blurredBg,
+          v_uv - normal * edgeFactor * u_refDistance * u_dpr *
+            vec2(u_resolution.y / u_resolution1x.x, 1.0),
+          u_refDispersion
+        );
+        outColor = mix(blurredPixel, vec4(1.0), fresnelFactor * u_refFresnelFactor * 0.7);
+      }
+    } else {
+      outColor = texture(u_bg, v_uv);
+    }
+  } else if (STEP <= 8) {
+    if (merged < 0.0) {
+      float nmerged = -1.0 * (merged * u_resolution1x.y);
+      float x_R_ratio = 1.0 - nmerged / u_refThickness;
+      float thetaI = safeAsin(pow(x_R_ratio, 2.0));
+      float thetaT = safeAsin(1.0 / u_refFactor * sin(thetaI));
+      float edgeFactor = -1.0 * tan(thetaT - thetaI);
+      if (nmerged >= u_refThickness) edgeFactor = 0.0;
+
+      float fresnelFactor = clamp(
+        pow(
+          1.0 + merged * u_resolution1x.y / 1500.0 * pow(500.0 / u_refFresnelRange, 2.0) +
+            u_refFresnelHardness,
+          5.0
+        ),
+        0.0, 1.0
+      );
+
+      float glareGeoFactor = clamp(
+        pow(
+          1.0 + merged * u_resolution1x.y / 1500.0 * pow(500.0 / u_glareRange, 2.0) +
+            u_glareHardness,
+          5.0
+        ),
+        0.0, 1.0
+      );
+
+      if (edgeFactor <= 0.0) {
+        outColor = texture(u_blurredBg, v_uv);
+      } else {
+        vec2 normal = getNormal(p1, p2, gl_FragCoord.xy);
+        float glareAngle = (vec2ToAngle(normalize(normal)) - PI / 4.0 + u_glareAngle) * 2.0;
+        int glareFarside = 0;
+        if (
+          glareAngle > PI * (2.0 - 0.5) && glareAngle < PI * (4.0 - 0.5) ||
+          glareAngle < PI * (0.0 - 0.5)
+        ) {
+          glareFarside = 1;
+        }
+
+        float glareAngleFactor =
+          (0.5 + sin(glareAngle) * 0.5) * 1.0 * (glareFarside == 1 ? 0.8 : 1.2) * u_glareFactor;
+        glareAngleFactor = clamp(pow(glareAngleFactor, 0.3 + u_glareConvergence * 1.5), 0.0, 1.0);
+
+        vec4 blurredPixel = texture(
+          u_blurredBg,
+          v_uv - normal * edgeFactor * u_refDistance * u_dpr *
+            vec2(u_resolution.y / u_resolution1x.x, 1.0),
+          u_refDispersion
+        );
+
+        outColor = blurredPixel;
+
+        vec3 tintLCH = SRGB_TO_LCH(
+          mix(vec3(1.0), vec3(u_tint.r, u_tint.g, u_tint.b), u_tint.a * 0.5)
+        );
+        tintLCH.x += 20.0 * fresnelFactor * u_refFresnelFactor;
+        tintLCH.x = clamp(tintLCH.x, 0.0, 100.0);
+
+        outColor = mix(outColor, vec4(1.0), fresnelFactor * u_refFresnelFactor * 0.7);
+        outColor = mix(outColor, vec4(1.0), glareAngleFactor * glareGeoFactor);
+      }
+    } else {
+      outColor = texture(u_bg, v_uv);
+    }
+  } else if (STEP <= 9) {
+    if (merged < 0.005) {
+      float nmerged = -1.0 * (merged * u_resolution1x.y);
+
+      float x_R_ratio = 1.0 - nmerged / u_refThickness;
+      float thetaI = safeAsin(pow(x_R_ratio, 2.0));
+      float thetaT = safeAsin(1.0 / u_refFactor * sin(thetaI));
+      float edgeFactor = -1.0 * tan(thetaT - thetaI);
+      if (nmerged >= u_refThickness) edgeFactor = 0.0;
+
+      if (edgeFactor <= 0.0) {
+        outColor = texture(u_blurredBg, v_uv);
+        outColor = mix(outColor, vec4(u_tint.r, u_tint.g, u_tint.b, 1.0), u_tint.a * 0.8);
+      } else {
+        float edgeH = nmerged / u_refThickness;
+        vec2 normal = getNormal(p1, p2, gl_FragCoord.xy);
+        vec4 blurredPixel = getTextureDispersion(
+          u_bg,
+          u_blurredBg,
+          u_blurEdge > 0 ? 1.0 : edgeH,
+          -normal * edgeFactor * u_refDistance * u_dpr *
+            vec2(u_resolution.y / (u_resolution1x.x * u_dpr), 1.0),
+          u_refDispersion
+        );
+
+        outColor = mix(blurredPixel, vec4(u_tint.r, u_tint.g, u_tint.b, 1.0), u_tint.a * 0.8);
+
+        float fresnelFactor = clamp(
+          pow(
+            1.0 + merged * u_resolution1x.y / 1500.0 * pow(500.0 / u_refFresnelRange, 2.0) +
+              u_refFresnelHardness,
+            5.0
+          ),
+          0.0, 1.0
+        );
+
+        vec3 fresnelTintLCH = SRGB_TO_LCH(
+          mix(vec3(1.0), vec3(u_tint.r, u_tint.g, u_tint.b), u_tint.a * 0.5)
+        );
+        fresnelTintLCH.x += 20.0 * fresnelFactor * u_refFresnelFactor;
+        fresnelTintLCH.x = clamp(fresnelTintLCH.x, 0.0, 100.0);
+
+        outColor = mix(
+          outColor,
+          vec4(LCH_TO_SRGB(fresnelTintLCH), 1.0),
+          fresnelFactor * u_refFresnelFactor * 0.7 * length(normal)
+        );
+
+        float glareGeoFactor = clamp(
+          pow(
+            1.0 + merged * u_resolution1x.y / 1500.0 * pow(500.0 / u_glareRange, 2.0) +
+              u_glareHardness,
+            5.0
+          ),
+          0.0, 1.0
+        );
+
+        float glareAngle = (vec2ToAngle(normalize(normal)) - PI / 4.0 + u_glareAngle) * 2.0;
+        int glareFarside = 0;
+        if (
+          glareAngle > PI * (2.0 - 0.5) && glareAngle < PI * (4.0 - 0.5) ||
+          glareAngle < PI * (0.0 - 0.5)
+        ) {
+          glareFarside = 1;
+        }
+        float glareAngleFactor =
+          (0.5 + sin(glareAngle) * 0.5) *
+          (glareFarside == 1 ? 1.2 * u_glareOppositeFactor : 1.2) * u_glareFactor;
+        glareAngleFactor = clamp(pow(glareAngleFactor, 0.1 + u_glareConvergence * 2.0), 0.0, 1.0);
+
+        vec3 glareTintLCH = SRGB_TO_LCH(
+          mix(blurredPixel.rgb, vec3(u_tint.r, u_tint.g, u_tint.b), u_tint.a * 0.5)
+        );
+        glareTintLCH.x += 150.0 * glareAngleFactor * glareGeoFactor;
+        glareTintLCH.y += 30.0 * glareAngleFactor * glareGeoFactor;
+        glareTintLCH.x = clamp(glareTintLCH.x, 0.0, 120.0);
+
+        outColor = mix(
+          outColor,
+          vec4(LCH_TO_SRGB(glareTintLCH), 1.0),
+          glareAngleFactor * glareGeoFactor * length(normal)
+        );
+      }
+    } else {
+      outColor = texture(u_bg, v_uv);
+    }
+
+    outColor = mix(outColor, texture(u_bg, v_uv), smoothstep(-0.001, 0.001, merged));
+  }
+
+  fragColor = outColor;
+}
+`;
+
+/* ==================================================================
+   预处理：展开 #include
+   ================================================================== */
+
+const INCLUDE_MAP = {
+  './lib/sdf.glsl':   LIB_SDF_GLSL,
+  './lib/math.glsl':  LIB_MATH_GLSL,
+  './lib/color.glsl': LIB_COLOR_GLSL,
+};
+
+function preprocess(src) {
+  return src.replace(/#include\s+['"]([^'"]+)['"]/g, (m, path) => INCLUDE_MAP[path] || '');
+}
+
+/* ==================================================================
+   WebGL2 初始化
+   ================================================================== */
+
+const canvas = document.getElementById('gl');
+const gl = canvas.getContext('webgl2', {
+  alpha: false,
+  antialias: false,
+  depth: false,
+  stencil: false,
+  premultipliedAlpha: false,
+  powerPreference: 'high-performance',
+});
+
+if (!gl) {
+  document.body.innerHTML =
+    '<div style="color:#fff;font-family:sans-serif;padding:40px;">此浏览器不支持 WebGL2</div>';
+  throw new Error('WebGL2 不可用');
+}
+
+const floatExt = gl.getExtension('EXT_color_buffer_float');
+if (!floatExt) console.warn('缺少 EXT_color_buffer_float，可能导致浮点帧缓冲不完整');
+
+/* ==================================================================
+   工具函数
+   ================================================================== */
+
+function compileShader(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    console.error('编译失败：\n' + gl.getShaderInfoLog(s));
+    console.error(src);
+    throw new Error('Shader 编译失败');
+  }
+  return s;
+}
+
+function createProgram(vsSrc, fsSrc) {
+  const p = gl.createProgram();
+  gl.attachShader(p, compileShader(gl.VERTEX_SHADER, vsSrc));
+  gl.attachShader(p, compileShader(gl.FRAGMENT_SHADER, fsSrc));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+    console.error('链接失败：\n' + gl.getProgramInfoLog(p));
+    throw new Error('Program 链接失败');
+  }
+  return p;
+}
+
+function getUniformInfo(program) {
+  const info = {};
+  const n = gl.getProgramParameter(program, gl.ACTIVE_UNIFORMS);
+  for (let i = 0; i < n; i++) {
+    const u = gl.getActiveUniform(program, i);
+    if (!u) continue;
+    const name = u.name.replace(/\[\d+\]$/, '');
+    const loc = gl.getUniformLocation(program, name);
+    if (loc !== null) info[name] = { location: loc, type: u.type, size: u.size };
+  }
+  return info;
+}
+
+function setUniform(info, name, value) {
+  const u = info[name];
+  if (!u) return;
+  const loc = u.location;
+  const type = u.type;
+  const isArr = Array.isArray(value) || value instanceof Float32Array || value instanceof Int32Array;
+
+  if (isArr) {
+    switch (type) {
+      case gl.FLOAT:      gl.uniform1fv(loc, value); break;
+      case gl.FLOAT_VEC2: gl.uniform2fv(loc, value); break;
+      case gl.FLOAT_VEC3: gl.uniform3fv(loc, value); break;
+      case gl.FLOAT_VEC4: gl.uniform4fv(loc, value); break;
+      case gl.INT:
+      case gl.SAMPLER_2D: gl.uniform1iv(loc, value); break;
+    }
+  } else if (typeof value === 'number') {
+    switch (type) {
+      case gl.FLOAT:      gl.uniform1f(loc, value); break;
+      case gl.INT:
+      case gl.BOOL:
+      case gl.SAMPLER_2D: gl.uniform1i(loc, value); break;
+    }
+  }
+}
+
+/* ---------- 高斯核 ---------- */
+const MAX_BLUR_RADIUS = 200;
+
+function computeGaussianKernelByRadius(radius) {
+  const r = Math.max(1, Math.min(radius, MAX_BLUR_RADIUS));
+  const sigma = Math.max(r / 2, 0.5);
+  const kernel = [];
+  let sum = 0;
+  for (let i = 0; i <= r; i++) {
+    const w = Math.exp(-(i * i) / (2 * sigma * sigma));
+    kernel.push(w);
+    sum += i === 0 ? w : 2 * w;
+  }
+  return kernel.map((v) => v / sum);
+}
+
+function buildBlurWeights(radius) {
+  const arr = new Float32Array(MAX_BLUR_RADIUS + 1);
+  const k = computeGaussianKernelByRadius(radius);
+  for (let i = 0; i < k.length && i <= MAX_BLUR_RADIUS; i++) arr[i] = k[i];
+  return arr;
+}
+
+/* ==================================================================
+   渲染通道
+   ================================================================== */
+
+class RenderPass {
+  constructor({ name, vs, fs, inputs = {}, outputToScreen = false }) {
+    this.name = name;
+    this.program = createProgram(vs, fs);
+    this.uniformInfo = getUniformInfo(this.program);
+    this.inputs = inputs;
+    this.outputToScreen = outputToScreen;
+    this.tex = null;
+    this.fbo = null;
+    this.w = 1;
+    this.h = 1;
+
+    // 全屏四边形 VAO
+    const vao = gl.createVertexArray();
+    gl.bindVertexArray(vao);
+    const buf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+    gl.bufferData(
+      gl.ARRAY_BUFFER,
+      new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]),
+      gl.STATIC_DRAW
+    );
+    const posLoc = gl.getAttribLocation(this.program, 'a_position');
+    gl.enableVertexAttribArray(posLoc);
+    gl.vertexAttribPointer(posLoc, 2, gl.FLOAT, false, 0, 0);
+    gl.bindVertexArray(null);
+    gl.bindBuffer(gl.ARRAY_BUFFER, null);
+    this.vao = vao;
+  }
+
+  resize(w, h) {
+    if (this.outputToScreen) return;
+    if (!this.tex) {
+      this.tex = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, this.tex);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      this.fbo = gl.createFramebuffer();
+    }
+    gl.bindTexture(gl.TEXTURE_2D, this.tex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, w, h, 0, gl.RGBA, gl.FLOAT, null);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.fbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this.tex, 0);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.bindTexture(gl.TEXTURE_2D, null);
+    this.w = w;
+    this.h = h;
+  }
+
+  render(globalUniforms, localUniforms, textureBindings) {
+    if (this.outputToScreen) {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight);
+    } else {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, this.fbo);
+      gl.viewport(0, 0, this.w, this.h);
+    }
+
+    gl.useProgram(this.program);
+
+    for (const k in globalUniforms) setUniform(this.uniformInfo, k, globalUniforms[k]);
+    for (const k in localUniforms) setUniform(this.uniformInfo, k, localUniforms[k]);
+
+    let unit = 0;
+    for (const uniformName in textureBindings) {
+      const tex = textureBindings[uniformName];
+      if (!tex) continue;
+      gl.activeTexture(gl.TEXTURE0 + unit);
+      gl.bindTexture(gl.TEXTURE_2D, tex);
+      setUniform(this.uniformInfo, uniformName, unit);
+      unit++;
+    }
+
+    gl.bindVertexArray(this.vao);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    gl.bindVertexArray(null);
+  }
+}
+
+/* ==================================================================
+   通道配置
+   ================================================================== */
+
+const VS = VERTEX_GLSL;
+const passes = {
+  bgPass: new RenderPass({
+    name: 'bgPass',
+    vs: VS,
+    fs: preprocess(FRAGMENT_BG_GLSL),
+    outputToScreen: false,
+  }),
+  vBlurPass: new RenderPass({
+    name: 'vBlurPass',
+    vs: VS,
+    fs: preprocess(FRAGMENT_BG_VBLUR_GLSL),
+    inputs: { u_prevPassTexture: 'bgPass' },
+    outputToScreen: false,
+  }),
+  hBlurPass: new RenderPass({
+    name: 'hBlurPass',
+    vs: VS,
+    fs: preprocess(FRAGMENT_BG_HBLUR_GLSL),
+    inputs: { u_prevPassTexture: 'vBlurPass' },
+    outputToScreen: false,
+  }),
+  mainPass: new RenderPass({
+    name: 'mainPass',
+    vs: VS,
+    fs: preprocess(FRAGMENT_MAIN_GLSL),
+    inputs: { u_blurredBg: 'hBlurPass', u_bg: 'bgPass' },
+    outputToScreen: true,
+  }),
+};
+
+const passOrder = [passes.bgPass, passes.vBlurPass, passes.hBlurPass, passes.mainPass];
+
+/* ==================================================================
+   Dummy 纹理（供 u_bgTexture 使用）
+   ================================================================== */
+
+const dummyTex = gl.createTexture();
+gl.bindTexture(gl.TEXTURE_2D, dummyTex);
+gl.texImage2D(
+  gl.TEXTURE_2D, 0, gl.RGBA,
+  1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE,
+  new Uint8Array([255, 255, 255, 255])
+);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+/* ==================================================================
+   默认控件值 —— 来自 liquid-glass.json
+   ================================================================== */
+
+const controls = {
+  refThickness: 20,
+  refDistance: 0.05,
+  refFactor: 1.4,
+  refDispersion: 7,
+  refFresnelRange: 30,
+  refFresnelHardness: 20,
+  refFresnelFactor: 20,
+  glareRange: 30,
+  glareHardness: 20,
+  glareFactor: 90,
+  glareConvergence: 50,
+  glareOppositeFactor: 80,
+  glareAngle: -45,
+  blurRadius: 1,
+  blurEdge: true,
+  tint: { r: 255, g: 255, b: 255, a: 0 },
+  shadowExpand: 25,
+  shadowFactor: 15,
+  shadowPosition: { x: 0, y: -10 },
+  bgType: 0,
+  shapeWidth: 200,
+  shapeHeight: 200,
+  shapeRadius: 80,
+  shapeRoundness: 5,
+  mergeRate: 0.05,
+  showShape1: true,
+  springSizeFactor: 10,
+  step: 9,
+};
+
+let blurWeights = buildBlurWeights(controls.blurRadius);
+
+/* ==================================================================
+   尺寸
+   ================================================================== */
+
+const state = {
+  cssW: 0,
+  cssH: 0,
+  bufW: 0,
+  bufH: 0,
+  dpr: 1,
+};
+
+function resize() {
+  const cssW = Math.max(1, window.innerWidth);
+  const cssH = Math.max(1, window.innerHeight);
+  const dpr = window.devicePixelRatio || 1;
+
+  const bufW = Math.max(1, Math.round(cssW * dpr));
+  const bufH = Math.max(1, Math.round(cssH * dpr));
+
+  state.cssW = cssW;
+  state.cssH = cssH;
+  state.bufW = bufW;
+  state.bufH = bufH;
+  state.dpr = dpr;
+
+  canvas.width = bufW;
+  canvas.height = bufH;
+  canvas.style.width = cssW + 'px';
+  canvas.style.height = cssH + 'px';
+
+  for (const p of passOrder) p.resize(bufW, bufH);
+}
+
+/* ==================================================================
+   鼠标 / 弹簧
+   ================================================================== */
+
+const pointer = {
+  // 目标位置（物理像素，y 从底部）
+  targetX: 0,
+  targetY: 0,
+  // 原始指针位置
+  rawX: 0,
+  rawY: 0,
+  // 弹簧平滑后的位置
+  springX: 0,
+  springY: 0,
+  // 弹簧速度（物理像素 / 秒）
+  velX: 0,
+  velY: 0,
+  // 是否收到过鼠标事件
+  active: false,
+};
+
+function setPointerFromEvent(clientX, clientY) {
+  const x = clientX * state.dpr;
+  const y = (window.innerHeight - clientY) * state.dpr;
+  pointer.rawX = x;
+  pointer.rawY = y;
+  pointer.targetX = x;
+  pointer.targetY = y;
+  if (!pointer.active) {
+    // 首次收到鼠标事件，直接吸附
+    pointer.springX = x;
+    pointer.springY = y;
+    pointer.active = true;
+  }
+}
+
+window.addEventListener(
+  'pointermove',
+  (e) => setPointerFromEvent(e.clientX, e.clientY),
+  { passive: true }
+);
+
+window.addEventListener(
+  'touchmove',
+  (e) => {
+    if (e.touches[0]) setPointerFromEvent(e.touches[0].clientX, e.touches[0].clientY);
+  },
+  { passive: true }
+);
+
+/* ==================================================================
+   渲染循环
+   ================================================================== */
+
+let lastTime = performance.now();
+
+function render(now) {
+  requestAnimationFrame(render);
+
+  const dt = Math.min((now - lastTime) / 1000, 0.05);
+  lastTime = now;
+
+  // ---------- 弹簧平滑 ----------
+  const stiffness = 220;
+  const damping = 26;
+  const ax = (pointer.targetX - pointer.springX) * stiffness - pointer.velX * damping;
+  const ay = (pointer.targetY - pointer.springY) * stiffness - pointer.velY * damping;
+  pointer.velX += ax * dt;
+  pointer.velY += ay * dt;
+  pointer.springX += pointer.velX * dt;
+  pointer.springY += pointer.velY * dt;
+
+  // 鼠标速度（px/ms），用于形状的呼吸伸缩
+  const speedX = Math.abs(pointer.velX) / 1000;
+  const speedY = Math.abs(pointer.velY) / 1000;
+
+  const shapeW =
+    controls.shapeWidth +
+    (speedX * controls.shapeWidth * controls.springSizeFactor) / 100;
+  const shapeH =
+    controls.shapeHeight +
+    (speedY * controls.shapeHeight * controls.springSizeFactor) / 100;
+
+  const shapeRadius =
+    ((Math.min(shapeW, shapeH) / 2) * controls.shapeRadius) / 100;
+
+  // ---------- 全局 uniform ----------
+  const globalUniforms = {
+    u_resolution: [state.bufW, state.bufH],
+    u_dpr: state.dpr,
+    u_blurWeights: blurWeights,
+    u_blurRadius: controls.blurRadius,
+    u_mouse: [pointer.rawX, pointer.rawY],
+    u_mouseSpring: [pointer.springX, pointer.springY],
+    u_shapeWidth: shapeW,
+    u_shapeHeight: shapeH,
+    u_shapeRadius: shapeRadius,
+    u_shapeRoundness: controls.shapeRoundness,
+    u_mergeRate: controls.mergeRate,
+    u_glareAngle: (controls.glareAngle * Math.PI) / 180,
+    u_showShape1: controls.showShape1 ? 1 : 0,
+  };
+
+  // ---------- bgPass 专属 uniform ----------
+  const bgUniforms = {
+    u_time: now / 1000,
+    u_bgType: controls.bgType,
+    u_bgTextureRatio: 1,
+    u_bgTextureReady: 0,
+    u_shadowExpand: controls.shadowExpand,
+    u_shadowFactor: controls.shadowFactor / 100,
+    u_shadowPosition: [-controls.shadowPosition.x, -controls.shadowPosition.y],
+  };
+
+  // ---------- mainPass 专属 uniform ----------
+  const mainUniforms = {
+    u_tint: [
+      controls.tint.r / 255,
+      controls.tint.g / 255,
+      controls.tint.b / 255,
+      controls.tint.a,
+    ],
+    u_refThickness: controls.refThickness,
+    u_refDistance: controls.refDistance,
+    u_refFactor: controls.refFactor,
+    u_refDispersion: controls.refDispersion,
+    u_refFresnelRange: controls.refFresnelRange,
+    u_refFresnelHardness: controls.refFresnelHardness / 100,
+    u_refFresnelFactor: controls.refFresnelFactor / 100,
+    u_glareRange: controls.glareRange,
+    u_glareHardness: controls.glareHardness / 100,
+    u_glareConvergence: controls.glareConvergence / 100,
+    u_glareOppositeFactor: controls.glareOppositeFactor / 100,
+    u_glareFactor: controls.glareFactor / 100,
+    u_blurEdge: controls.blurEdge ? 1 : 0,
+    STEP: controls.step,
+  };
+
+  // ---------- bgPass ----------
+  passes.bgPass.render(globalUniforms, bgUniforms, {
+    u_bgTexture: dummyTex,
+  });
+
+  // ---------- 垂直模糊 ----------
+  passes.vBlurPass.render(globalUniforms, {}, {
+    u_prevPassTexture: passes.bgPass.tex,
+  });
+
+  // ---------- 水平模糊 ----------
+  passes.hBlurPass.render(globalUniforms, {}, {
+    u_prevPassTexture: passes.vBlurPass.tex,
+  });
+
+  // ---------- 主合成 ----------
+  passes.mainPass.render(globalUniforms, mainUniforms, {
+    u_blurredBg: passes.hBlurPass.tex,
+    u_bg: passes.bgPass.tex,
+  });
+}
+
+/* ==================================================================
+   启动
+   ================================================================== */
+
+function boot() {
+  resize();
+
+  // 初始鼠标位置 = 屏幕中心（物理像素，y 从底部）
+  const cx = state.bufW * 0.5;
+  const cy = state.bufH * 0.5;
+  pointer.rawX = cx;
+  pointer.rawY = cy;
+  pointer.targetX = cx;
+  pointer.targetY = cy;
+  pointer.springX = cx;
+  pointer.springY = cy;
+
+  requestAnimationFrame((t) => {
+    lastTime = t;
+    requestAnimationFrame(render);
+  });
+}
+
+window.addEventListener('resize', resize);
+window.addEventListener('orientationchange', () => setTimeout(resize, 120));
+
+boot();
+
+</script>
+</body>
+</html>
